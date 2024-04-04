@@ -2,7 +2,7 @@
 
 ## 1. Description
 
-This is about processing an executive report for the hospital management, by synthesizing patient data, survey data and national statistics.
+This is about processing an executive report for the hospital management, by synthesizing patient data and survey data from PostgreSQL databsae, and API from government national statistics.
 With the help of this readme file, codes, markdown file, folder and prototype setup, our data analyst department will be able to routinely generate similar reports.
 This readme file will work through steps in the pipeline of analysis to enhance ***reproducibility and audibility.***
 
