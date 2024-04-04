@@ -1,0 +1,6 @@
+default:
+  secret:
+    mimic_user: 'user'
+    mimic_pwd: 'pwd'
+    odk_user: 'user@gmail.com'
+    odk_pwd: 'pwd'
