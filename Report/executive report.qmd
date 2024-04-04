@@ -1,0 +1,470 @@
+---
+format:
+  pdf:
+    papersize: a4
+    fontsize: "11pt"
+    fig-pos: "h"
+    tbl-pos: "h"
+geometry:
+  - left=0.25in
+  - right=0.25in
+  - top=0.25in
+  - bottom=0.25in
+editor: visual
+execute: 
+  echo: false
+  warning: false
+---
+
+```{r package, warning=FALSE, include=FALSE}
+library(dbplyr)
+library(DBI)
+library(RPostgreSQL)
+library(config)
+library(ruODK)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(treemapify)
+library(shiny)
+library(yaml)
+library(palmerpenguins)
+library(knitr)
+library(readr)
+library(httr)
+library(tinytex)
+library(kableExtra)
+library(stringr)
+```
+
+```{r etl_odk}
+#connect to ODK central
+ru_setup(url = "https://odk-survey.lshtm.ac.uk", 
+         un = get("secret")$odk_user, 
+         pw = get("secret")$odk_pwd,
+         svc = "https://odk-survey.lshtm.ac.uk/v1/projects/80/forms/HDM_Assessment.svc")
+# get data
+odk <- odata_submission_get()
+#clean subject_id
+odk$subject_id <- as.integer(gsub("_", "", odk$subject_id))
+```
+
+```{r etl_mimic}
+
+# connect to MIMIC III
+dbcon <-  DBI::dbConnect(
+  PostgreSQL (),
+  dbname = "mimic",
+  host = "healthdatascience.lshtm.ac.uk",
+  port = "5432",
+  user = get("secret")$mimic_user,
+  password = get("secret")$mimic_pwd)
+
+# (i) demographic of patients by making a table, one row for one distinct subject id
+patient_demo <- DBI::dbSendQuery(dbcon,
+    "SELECT DISTINCT ON (a.subject_id)
+    a.subject_id,a.gender,
+    EXTRACT(EPOCH FROM ((b.admittime - a.dob))/(3600*24*365.25)) as age_in_years,
+    b.marital_status,
+    b.ethnicity
+FROM 
+    patients a
+INNER JOIN 
+    admissions b ON a.subject_id = b.subject_id")
+patient_demo_table <- dbFetch(patient_demo)
+
+# (ii) total stay times and ICU stay times,characterised in terms of median, 25/75% quantiles, and min-max for both indicators. Each ICU stay will be a unit of sample, then further processing will be done to make each admission stay to be a unit of sample.
+adm_icu <- DBI::dbSendQuery(dbcon,
+    "SELECT 
+    a.subject_id, a.hadm_id, b.icustay_id,
+    c.gender,
+    EXTRACT(EPOCH FROM ((a.admittime - c.dob))/(3600*24*365.25)) as age_in_years,
+    EXTRACT(EPOCH FROM ((a.dischtime - a.admittime))/(3600*24)) as total_staytime,
+    b.los, EXTRACT(EPOCH from b.outtime - b.intime)/(3600*24) as icu_staytime
+FROM 
+    admissions a
+FULL JOIN 
+    icustays b ON a.subject_id = b.subject_id and a.hadm_id = b.hadm_id
+FULL JOIN
+    patients c on a.subject_id = c.subject_id
+")
+adm_icu_table <- dbFetch(adm_icu)
+
+# (iii) extract table for patients with v450 who stayed in ICU
+icu_pt <- DBI::dbSendQuery(dbcon,
+    "SELECT 
+    b.subject_id, b.hadm_id, b.icustay_id,
+    EXTRACT(EPOCH from sum((b.outtime - b.intime)/(3600*24))) as icu_staytime,
+    MIN(intime) - interval '6 hour' AS first_icu,
+    MAX(outtime) + interval '6 hour' AS last_icu,
+    c.gender, d.deathtime
+FROM (SELECT hadm_id FROM diagnoses_icd a WHERE icd9_code LIKE 'V450%' GROUP BY hadm_id) cardiacdev
+JOIN icustays b USING (hadm_id)
+LEFT JOIN
+    patients c on b.subject_id = c.subject_id
+LEFT JOIN 
+    admissions d on b.hadm_id = d.hadm_id
+GROUP BY 
+    b.subject_id, b.hadm_id, b.icustay_id, c.gender, d.deathtime")
+icu_pt_table <- dbFetch(icu_pt)
+
+# (iv) extract table for v450 who stayed in ICU and died in ICU, including icd codes
+icu_pt_icd <- DBI::dbSendQuery(dbcon,
+   "SELECT 
+    b.subject_id, b.hadm_id, b.icustay_id,
+    MIN(intime) - interval '6 hour' AS first_icu,
+    MAX(outtime) + interval '6 hour' AS last_icu,
+    b.first_careunit, c.gender, e.deathtime, 
+    e.admittime, c.dob, b.los as icu_days, code_summary, title_summary
+FROM (
+    SELECT hadm_id 
+    FROM diagnoses_icd 
+    WHERE icd9_code LIKE 'V450%' 
+    GROUP BY hadm_id
+) cardiacdev
+JOIN icustays b USING (hadm_id)
+LEFT JOIN patients c ON b.subject_id = c.subject_id
+LEFT JOIN diagnoses_icd d ON b.hadm_id = d.hadm_id
+LEFT JOIN admissions e ON b.hadm_id = e.hadm_id
+JOIN (
+    SELECT 
+        hadm_id,
+        ARRAY_TO_STRING(ARRAY_AGG(icd9_code), ', ') AS code_summary,
+        ARRAY_TO_STRING(ARRAY_AGG(short_title), ', ') AS title_summary
+    FROM (
+        SELECT * 
+        FROM diagnoses_icd 
+        ORDER BY hadm_id, icd9_code
+    ) sort_icd
+    JOIN d_icd_diagnoses USING (icd9_code)
+    GROUP BY hadm_id
+) diag_summary ON b.hadm_id = diag_summary.hadm_id
+GROUP BY
+    b.subject_id, b.hadm_id, b.icustay_id, b.first_careunit, c.gender, e.deathtime, e.admittime, c.dob, b.los, code_summary, title_summary;
+")
+icu_pt_icd_tbl <- dbFetch(icu_pt_icd)
+```
+
+```{r disconnect_lock, include=FALSE}
+
+## close the connections and disconnect
+dbClearResult(patient_demo) # i
+dbClearResult(adm_icu) # ii
+dbClearResult(icu_pt) # iii
+dbClearResult(icu_pt_icd) # iv
+dbDisconnect(dbcon) # disconnect the postgresever connection
+```
+
+```{r task_1}
+######### (task i) ###########
+## data preparation
+# change age to age group
+patient_demo_table$age_gp <- cut(
+  patient_demo_table$age_in_years,
+  breaks = c(0, 18, 30, 50, 60, Inf),
+  labels = c("0-18", "19-30", "31-50", "51-60", "61+"))
+# change name of gender
+patient_demo_table <- patient_demo_table %>% 
+  mutate (gender = case_when(
+    gender == "M" ~ "Male",
+    gender == "F" ~ "Female",
+    TRUE ~ gender))
+# grouping ethnic groups
+patient_demo_table <- patient_demo_table %>% 
+  mutate(ethnic_gp = case_when(
+    grepl("ASIA", ethnicity, ignore.case = TRUE) ~ "Asian",
+    grepl("BLACK", ethnicity, ignore.case = TRUE) ~ "Black",
+    grepl("HISPANIC", ethnicity, ignore.case = TRUE) ~ "Hispanic",
+    grepl("WHITE", ethnicity, ignore.case = TRUE) ~ "White",
+    grepl("UNKNOWN", ethnicity, ignore.case = TRUE) ~ "Unknown",
+    TRUE ~ "Other"))
+
+#  Add vaccination status from ODK
+pt_demo <- left_join(patient_demo_table, odk %>% select(subject_id, admitage_yrs, vaccinated), by = "subject_id")
+
+# summarize the demographic characteristics 
+age_sex <- pt_demo %>% filter(!is.na(age_gp)) %>% count(age_gp, gender) %>% arrange(age_gp)
+ethnicity <- pt_demo %>% count(ethnic_gp) %>% arrange(desc(n))
+```
+
+```{r task_2}
+################( task ii)##################
+## data preparation
+# join with adm_icu with odk
+adm_icu_vac <- left_join(adm_icu_table, odk %>% select(subject_id, vaccinated), by = "subject_id")
+
+# age group for analysis
+adm_icu_vac$age_gp <- cut(adm_icu_vac$age_in_years,
+                          breaks = c(0, 59, Inf), labels = c("<60 yrs", "60+ yrs"))
+# change name of gender
+adm_icu_vac <- adm_icu_vac %>% 
+  mutate (gender = case_when(
+    gender == "M" ~ "Male",
+    gender == "F" ~ "Female",
+    TRUE ~ gender))
+# change vaccine status
+adm_icu_vac <- adm_icu_vac %>% 
+  mutate (vaccinated = case_when(
+    vaccinated == "NO" ~ "0",
+    vaccinated == "YES" ~ "1+ doses",
+    TRUE ~ vaccinated))
+
+## creating data tables to include in report
+
+# create a seperate dataframe to summarize admission stays by measuring each admission
+ii_adm <- adm_icu_vac %>% filter(total_staytime > 0) %>%
+  group_by(hadm_id) %>%
+  summarize(across(everything(), list(first = ~first(.))), .groups = "drop")
+
+# Calculate and create a summary table for admissions
+ii_adm_sum <- bind_rows(
+  ii_adm %>% group_by(Group = gender_first) %>% summarize(
+      Median = round(median(total_staytime_first),1),
+      "25 Q" = round(quantile(total_staytime_first, 0.25),1),
+      "75 Q" = round(quantile(total_staytime_first, 0.75),1),
+      MIN = round(min(total_staytime_first),3),
+      MAX = round(max(total_staytime_first),1)),
+  ii_adm %>% filter(!is.na(age_gp_first)) %>% 
+    group_by(Group = age_gp_first) %>% summarize(
+      Median = round(median(total_staytime_first),1),
+      "25 Q" = round(quantile(total_staytime_first, 0.25),1),
+      "75 Q" = round(quantile(total_staytime_first, 0.75),1),
+      MIN = round(min(total_staytime_first),3),
+      MAX = round(max(total_staytime_first),1)),
+  ii_adm %>% filter(!is.na(vaccinated_first)) %>% 
+    group_by(Group = vaccinated_first) %>% summarize(
+      Median = round(median(total_staytime_first),1),
+      "25 Q" = round(quantile(total_staytime_first, 0.25),1),
+      "75 Q" = round(quantile(total_staytime_first, 0.75),1),
+      MIN = round(min(total_staytime_first),3),
+      MAX = round(max(total_staytime_first),1)),
+  ii_adm %>% summarize(
+      Group = "Overall",
+      Median = round(median(total_staytime_first), 1),
+      "25 Q" = round(quantile(total_staytime_first, 0.25), 1),
+      "75 Q" = round(quantile(total_staytime_first, 0.75), 1),
+      MIN = round(min(total_staytime_first), 3),
+      MAX = round(max(total_staytime_first), 1))) %>%
+  ungroup()
+
+# Calculate and create a summary table for icu stays
+ii_icu_sum <- bind_rows(
+  adm_icu_vac %>% filter(!is.na(icu_staytime)) %>% 
+    group_by(Group = gender) %>% summarize(
+    Median = round(median(icu_staytime),1),
+    "25 Q" = round(quantile(icu_staytime, 0.25),1),
+    "75 Q" = round(quantile(icu_staytime, 0.75),1),
+    MIN = round(min(icu_staytime),3),
+    MAX = round(max(icu_staytime),1)),
+  adm_icu_vac %>% filter(!is.na(icu_staytime)) %>% 
+    filter(!is.na(age_gp))%>% group_by(Group = age_gp) %>% summarize(
+      Median = round(median(icu_staytime),1),
+      "25 Q" = round(quantile(icu_staytime, 0.25),1),
+      "75 Q" = round(quantile(icu_staytime, 0.75),1),
+      MIN = round(min(icu_staytime),3),
+      MAX = round(max(icu_staytime),1)),
+  adm_icu_vac %>% filter(!is.na(icu_staytime)) %>% 
+    filter(!is.na(vaccinated)) %>% 
+    group_by(Group = vaccinated) %>% summarize(
+      Median = round(median(icu_staytime),1),
+      "25 Q" = round(quantile(icu_staytime, 0.25),1),
+      "75 Q" = round(quantile(icu_staytime, 0.75),1),
+      MIN = round(min(icu_staytime),3),
+      MAX = round(max(icu_staytime),1)),
+  adm_icu_vac %>% filter(!is.na(icu_staytime)) %>% summarize(
+    Group = "Overall",
+    Median = round(median(icu_staytime),1),
+    "25 Q" = round(quantile(icu_staytime, 0.25),1),
+    "75 Q" = round(quantile(icu_staytime, 0.75),1),
+    MIN = round(min(icu_staytime),3),
+    MAX = round(max(icu_staytime),1))) %>%
+  ungroup()
+```
+
+```{r task_3}
+########## (task iii) ################
+## data preparation
+# join with adm_icu with odk for (ii)
+icu_pt_vac <- left_join(icu_pt_table, odk %>% select(subject_id, vaccinated), by = "subject_id")
+
+# change name of gender
+icu_pt_vac <- icu_pt_vac %>% 
+  mutate (gender = case_when(
+    gender == "M" ~ "Male",
+    gender == "F" ~ "Female",
+    TRUE ~ gender))
+# change vaccine status
+icu_pt_vac <- icu_pt_vac %>% 
+  mutate (vaccinated = case_when(
+    vaccinated == "NO" ~ "0",
+    vaccinated == "YES" ~ "1+ doses",
+    TRUE ~ vaccinated))
+# a new column for icu death
+icu_pt_vac <- icu_pt_vac %>% 
+  mutate(icu_death = case_when(
+    first_icu < deathtime & deathtime < last_icu ~ "Died in ICU",
+    TRUE ~ "Did not die in ICU"
+  ))
+```
+
+```{r task_4}
+########## (task iv) ################
+## data preparation
+# join with adm_icu with odk for (iv)
+icu_pt_vac_icd <- left_join(icu_pt_icd_tbl, odk %>% select (subject_id, vaccinated, admitage_yrs), by = "subject_id")
+
+# change vaccine status
+icu_pt_vac_icd <- icu_pt_vac_icd %>% 
+  mutate (vaccinated = case_when(
+    vaccinated == "NO" ~ "N",
+    vaccinated == "YES" ~ "Y",
+    TRUE ~ vaccinated))
+# a new column for icu death
+icu_pt_vac_icd <- icu_pt_vac_icd %>% 
+  mutate(icu_death = case_when(
+    first_icu < deathtime & deathtime < last_icu ~ "Died in ICU",
+    TRUE ~ "Did not die in ICU"))
+
+# Exclude those who are not icu death from the dataset
+icu_icd <- subset(icu_pt_vac_icd,icu_pt_vac_icd$icu_death == 'Died in ICU')
+# round number of days in ICU for clear vision
+icu_icd <- icu_icd %>% mutate (icu_days = round (icu_days,2))
+
+# Describe summary for each patient
+summary_iv <- icu_icd %>% filter (!is.na(vaccinated)) %>%
+  select(subject_id, first_careunit, gender, admitage_yrs, icu_days, title_summary, code_summary,vaccinated)
+
+# combine columns
+summary_iv$idsum <- paste(summary_iv$subject_id,'',summary_iv$gender,summary_iv$admitage_yrs,'',summary_iv$vaccinated) #id
+summary_iv$icusum <- paste(summary_iv$first_careunit,'',summary_iv$icu_days) #icu
+
+# arrange and rename
+summary_iv <- summary_iv %>%
+  select(idsum, icusum, code_summary, title_summary) %>%  # Rearrange columns
+  rename("Patient (Sex, age, vaccinated)" = idsum, "First care unit (days in ICU)" = icusum, "ICD9 codes" = code_summary, 'Diagnosis' = title_summary)  # Rename columns
+
+# cut the length of two ICD9 columns and replace with ellipsis to save space
+summary_iv$`ICD9 codes` <- str_trunc(summary_iv$`ICD9 codes`,30)
+summary_iv$Diagnosis <- str_trunc(summary_iv$Diagnosis,70)
+```
+
+```{r task_5}
+## v #####
+# data preparation
+# get data from source
+endpoint <- paste("https://api.coronavirus.data.gov.uk/v2/data?areaType=nation&areaCode=E92000001&metric=newAdmissions&metric=newCasesByPublishDate&release=2021-03-31&format=csv")
+webdata <- read.csv(endpoint)
+
+# Convert the 'date' column to a Date object
+webdata$date <- as.Date(webdata$date)
+# Filter data for the most recent month
+recent_month_data <- webdata %>%
+  filter(format(date, "%Y-%m") == format(max(date), "%Y-%m"))
+```
+
+### Demographic of admitted patients
+
+```{r pyramid}
+#| label: fig-demo
+#| fig-cap: Demographic characteristics
+#| fig-subcap:
+#|   - "Age and sex distribution"
+#|   - "Vaccnication status"
+#| layout-ncol: 2
+#| fig-width: 3 
+#| fig-height: 2.6
+#| fig-align: "left"
+#| column: page
+
+age_sex %>%
+mutate(n = ifelse(gender == "Male", n * (-1), n * 1)) %>%
+  ggplot(aes(x = age_gp, y = n, fill = factor(gender))) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(labels = abs) +
+  coord_flip() +
+  labs(x = "Age groups", y = "Number of cases", fill = "Gender") +
+  theme(legend.position="bottom")
+
+pt_demo %>% 
+  filter(!is.na(vaccinated)) %>%
+  ggplot(aes(x = age_gp, fill = vaccinated)) +
+  geom_bar(position = "fill") +
+  facet_wrap(~gender) +
+  labs(x = "Age Group", y = "Proportion",fill = "Vaccination Status") +
+  scale_fill_manual(values = c("YES" = "#66CC99", "NO" = "#D55E00")) +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  theme(legend.position="bottom")
+```
+
+### Hospital stays among patients
+
+For `r n_distinct(adm_icu_vac$subject_id)` cases, there were `r n_distinct(adm_icu_vac$hadm_id)` admission episodes and `r n_distinct(adm_icu_vac$icustay_id)` ICU admission episodes.
+
+```{r stays}
+#| label: tbl-stays
+#| tbl-cap: "Duration of stays"
+#| tbl-subcap: 
+#|   - "Hospital stays"
+#|   - "ICU stays"
+#| layout-ncol: 2
+#| column: page
+
+kable(ii_adm_sum, linesep = "", booktabs=TRUE) %>% 
+  kable_styling(font_size = 9,
+                latex_options = "striped") %>%
+  row_spec(c(0, 7), bold = TRUE) %>%
+  column_spec(1, bold = TRUE) 
+
+kable(ii_icu_sum, linesep = "", booktabs=TRUE) %>% 
+  kable_styling(font_size = 9,
+                latex_options = "striped") %>%
+  row_spec(c(0, 7), bold = TRUE) %>%
+  column_spec(1, bold = TRUE) 
+```
+
+### ICU stays for patient with cardiac devices
+
+Among `r n_distinct(icu_pt_vac$subject_id)` cases with cardiac devices who admitted to ICU, we summarized `r icu_pt_vac %>% filter (!is.na(vaccinated)) %>% summarise(n_distinct_icu = n_distinct(icustay_id))` ICU admission episodes of `r icu_pt_vac %>% filter (!is.na(vaccinated)) %>% summarise(n_distinct_subjects = n_distinct(subject_id))` cases with vaccination data. (outliers are excluded)
+
+```{r icu}
+#| label: fig-icu 
+#| fig-cap: Days spent in ICU
+#| fig-width: 8 
+#| fig-height: 2.5 
+
+icu_pt_vac %>% filter (!is.na(vaccinated)) %>%   
+  ggplot (aes(vaccinated, icu_staytime, fill = icu_death)) +
+  geom_boxplot() +   geom_boxplot(outlier.shape = NA) +
+  scale_y_continuous(limits = quantile(icu_pt_vac$icu_staytime, c(0.025, 0.975),na.rm = T)) +   
+  labs (x = NULL, y = "Days in ICU", fill = "ICU outcome") +   
+  facet_wrap(~ icu_death + gender, nrow = 1)
+```
+
+### List of patients with cardiac device who died in ICU
+
+Among `r n_distinct(icu_pt_vac$subject_id)` patients with cardiac devices who admitted to ICU, `r n_distinct(icu_icd$subject_id)` cases were died in ICU. Among them `r nrow(summary_iv)` cases has responded to ODK survey. We have summarized their information as follow.
+
+```{r icu_death}
+kable(summary_iv, longtable = TRUE, linesep = "") %>%    
+  kable_styling(font_size = 8, latex_options = "scale_down") %>%
+  column_spec(1, width = "2cm") %>%   
+  column_spec(2, width = "1.8cm") %>%   
+  column_spec(3, width = "4cm") %>%   
+  column_spec(4, width = "10.2cm") 
+```
+
+### COVID-19 in the community
+
+As per Coronavirus (COVID-19) dashboard from [https://coronavirus.data.gov.uk/](#0){.uri}, the red line shows infections per day and blue line represents hospital admissions.
+
+```{r website}
+#| label: fig-web 
+#| fig-cap: Situation of COVID-19 
+#| fig-width: 5 
+#| fig-height: 1.5
+
+ggplot(recent_month_data, aes(x = date)) +   geom_line(aes(y = newAdmissions), color = "blue") +   geom_line(aes(y = newCasesByPublishDate), color = "red") +   labs(x = NULL, y = "No. of cases") +   theme_minimal() +   scale_color_manual(values = c("blue", "red"))
+```
+
+### 
