@@ -219,4 +219,4 @@ To preview the prototype report, **'One-click'** report generation can be achiev
 -   **Step 4:** Click on 'Render'
 
 ## 
-
+_This is the copy of my submitted assignment for Health Data Management module duirng MSc Health Data Science Course_
